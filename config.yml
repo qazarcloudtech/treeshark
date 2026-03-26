@@ -1,0 +1,20 @@
+# treeshark config 🦈
+# Minimum file size to flag (supports: B, KB, MB, GB, TB)
+min_size: "1GB"
+
+# Directories to scan
+scan_paths:
+  - "."
+
+# How many top files to display
+top_n: 50
+
+# Patterns to exclude (glob-style)
+exclude:
+  - ".git"
+  - "node_modules"
+  - ".cache"
+  - "target"
+
+# Number of threads (0 = all available CPU cores)
+threads: 0
