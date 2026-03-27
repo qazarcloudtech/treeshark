@@ -32,6 +32,8 @@ pub struct ScanResult {
     pub scan_id: i64,
     pub total_scanned: u64,
     pub files_found: u64,
+    pub new_files: u64,
+    pub updated_files: u64,
     pub files_per_sec: u64,
     pub duration_secs: f64,
     pub threads: usize,
@@ -192,6 +194,8 @@ pub fn scan(config: &Config, config_dir: &Path, db: &Db, resume: bool) -> Result
     let start = Instant::now();
     let total_scanned = AtomicU64::new(0);
     let total_matched = AtomicU64::new(0);
+    let mut total_new: u64 = 0;
+    let mut total_updated: u64 = 0;
 
     // ─── Walk each path (sequential for resume tracking) ────
     // Within each path, walk_parallel fans out across ALL cores.
@@ -223,7 +227,9 @@ pub fn scan(config: &Config, config_dir: &Path, db: &Db, resume: bool) -> Result
         // Flush this path's results to SQLite
         let files = std::mem::take(&mut *state.results.lock());
         if !files.is_empty() {
-            db.upsert_files_batch(&files, scan_id)?;
+            let (new, updated) = db.upsert_files_batch(&files, scan_id)?;
+            total_new += new as u64;
+            total_updated += updated as u64;
         }
 
         // Accumulate totals
@@ -264,13 +270,14 @@ pub fn scan(config: &Config, config_dir: &Path, db: &Db, resume: bool) -> Result
         status,
     )?;
 
-    // Mark files not seen in this scan as missing — ONLY under the scanned paths
+    // Mark files not seen in this scan as missing — ONLY under the scanned paths,
+    // and ONLY files whose size >= this scan's min_size (smaller files weren't looked for)
     if !was_interrupted {
         let scanned_path_strs: Vec<String> = scan_paths
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
-        let gone = db.mark_missing_from_scan(scan_id, &scanned_path_strs)?;
+        let gone = db.mark_missing_from_scan(scan_id, &scanned_path_strs, min_bytes)?;
         if gone > 0 {
             println!(
                 "   {} Marked {} files as missing (not found in this scan)",
@@ -294,11 +301,21 @@ pub fn scan(config: &Config, config_dir: &Path, db: &Db, resume: bool) -> Result
         duration.as_secs_f64(),
         format_with_commas(files_per_sec).bold().green(),
     );
-    println!(
-        "   {} Found {} files >= threshold",
-        "✓".green().bold(),
-        matched.to_string().bold().red(),
-    );
+    if total_new > 0 {
+        println!(
+            "   {} Found {} files >= threshold ({} new, {} already known)",
+            "✓".green().bold(),
+            matched.to_string().bold().red(),
+            total_new.to_string().bold().green(),
+            total_updated.to_string().dimmed(),
+        );
+    } else {
+        println!(
+            "   {} Found {} files >= threshold (all already known)",
+            "✓".green().bold(),
+            matched.to_string().bold().red(),
+        );
+    }
     println!(
         "   {} {} threads saturating {} CPU cores",
         "✓".green().bold(),
@@ -316,6 +333,8 @@ pub fn scan(config: &Config, config_dir: &Path, db: &Db, resume: bool) -> Result
         scan_id,
         total_scanned: scanned,
         files_found: matched,
+        new_files: total_new,
+        updated_files: total_updated,
         files_per_sec,
         duration_secs: duration.as_secs_f64(),
         threads: n_threads,
