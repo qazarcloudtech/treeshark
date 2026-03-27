@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod deleter;
 mod display;
+mod mover;
 mod scanner;
 
 use anyhow::Result;
@@ -69,6 +70,18 @@ enum Commands {
 
     /// 🗑️  Interactively select and delete files (scoped to config scan_paths)
     Delete {
+        /// Show top N files (0 = all)
+        #[arg(short = 'n', long, default_value = "0")]
+        top: usize,
+
+        /// Filter by extension, e.g. -f mp4 -f zip (can be repeated)
+        #[arg(short = 'f', long = "filter")]
+        filter_ext: Vec<String>,
+
+        /// Exclude extensions, e.g. -x wav,flac (can be repeated)
+        #[arg(short = 'x', long = "exclude")]
+        exclude_ext: Vec<String>,
+
         /// Show files from ALL paths (ignore scan_paths scope)
         #[arg(short, long)]
         all: bool,
@@ -76,6 +89,55 @@ enum Commands {
         /// Filter to a specific path (can be repeated)
         #[arg(short = 'P', long = "path")]
         filter_path: Vec<String>,
+    },
+
+    /// 📦 Move files to a staging folder for review (by extension)
+    Move {
+        /// Show top N files (0 = all)
+        #[arg(short = 'n', long, default_value = "0")]
+        top: usize,
+
+        /// Filter by extension, e.g. -f mp4,wav (required to avoid accidents)
+        #[arg(short = 'f', long = "filter")]
+        filter_ext: Vec<String>,
+
+        /// Exclude extensions, e.g. -x flac
+        #[arg(short = 'x', long = "exclude")]
+        exclude_ext: Vec<String>,
+
+        /// Destination staging folder
+        #[arg(short = 't', long = "to", default_value = "treeshark-staging")]
+        to: String,
+
+        /// Show files from ALL paths (ignore scan_paths scope)
+        #[arg(short, long)]
+        all: bool,
+
+        /// Filter to a specific path (can be repeated)
+        #[arg(short = 'P', long = "path")]
+        filter_path: Vec<String>,
+
+        /// Organize files into __<ext>__ folders by extension (e.g. ~/stock/__mp4__/)
+        #[arg(short = 'F', long)]
+        full_organized: bool,
+    },
+
+    /// 🧨 Delete entire __<ext>__ folders from ~/stock (full-organized cleanup)
+    Purge {
+        /// Override stock directory (default: ~/stock)
+        #[arg(short = 't', long = "from")]
+        from: Option<String>,
+    },
+
+    /// ♻️  Restore moved files back to original locations
+    Restore {
+        /// Filter by extension, e.g. -f mp4,wav
+        #[arg(short = 'f', long = "filter")]
+        filter_ext: Vec<String>,
+
+        /// Exclude extensions, e.g. -x flac
+        #[arg(short = 'x', long = "exclude")]
+        exclude_ext: Vec<String>,
     },
 
     /// 📊 Show database stats
@@ -251,11 +313,71 @@ fn main() -> Result<()> {
             display::print_files(&files, &title);
         }
 
-        Commands::Delete { all, filter_path } => {
+        Commands::Delete { top, filter_ext, exclude_ext, all, filter_path } => {
             let config = load_config(&config_path)?;
             let db = Db::open(config_dir)?;
             let prefixes = resolve_path_filter(all, &filter_path, &config, config_dir);
-            deleter::interactive_delete(&db, config.top_n, &prefixes)?;
+            let limit = if top == 0 { usize::MAX } else { top };
+            // Normalize extensions: split commas, strip leading dot, lowercase
+            let parse_exts = |v: &[String]| -> Vec<String> {
+                v.iter()
+                    .flat_map(|e| e.split(','))
+                    .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .collect()
+            };
+            let incl = parse_exts(&filter_ext);
+            let excl = parse_exts(&exclude_ext);
+            deleter::interactive_delete(&db, limit, &prefixes, &incl, &excl)?;
+        }
+
+        Commands::Move { top, filter_ext, exclude_ext, to, all, filter_path, full_organized } => {
+            let config = load_config(&config_path)?;
+            let db = Db::open(config_dir)?;
+            let prefixes = resolve_path_filter(all, &filter_path, &config, config_dir);
+            let limit = if top == 0 { usize::MAX } else { top };
+            let parse_exts = |v: &[String]| -> Vec<String> {
+                v.iter()
+                    .flat_map(|e| e.split(','))
+                    .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .collect()
+            };
+            let incl = parse_exts(&filter_ext);
+            let excl = parse_exts(&exclude_ext);
+            let dest = if full_organized {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                PathBuf::from(home).join("stock")
+            } else {
+                PathBuf::from(&to)
+            };
+            mover::move_files(&db, limit, &prefixes, &incl, &excl, &dest, full_organized)?;
+        }
+
+        Commands::Purge { from } => {
+            let db = Db::open(config_dir)?;
+            let stock_dir = match from {
+                Some(p) => PathBuf::from(p),
+                None => {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                    PathBuf::from(home).join("stock")
+                }
+            };
+            mover::purge_ext_folders(&db, &stock_dir)?;
+        }
+
+        Commands::Restore { filter_ext, exclude_ext } => {
+            let db = Db::open(config_dir)?;
+            let parse_exts = |v: &[String]| -> Vec<String> {
+                v.iter()
+                    .flat_map(|e| e.split(','))
+                    .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .collect()
+            };
+            let incl = parse_exts(&filter_ext);
+            let excl = parse_exts(&exclude_ext);
+            mover::restore_files(&db, &incl, &excl)?;
         }
 
         Commands::Stats => {

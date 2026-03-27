@@ -25,11 +25,47 @@ fn build_theme() -> ColorfulTheme {
     }
 }
 
-pub fn interactive_delete(db: &Db, top_n: usize, path_prefixes: &[String]) -> Result<()> {
-    let files = db.get_top_files(top_n, Some("exists"), path_prefixes)?;
+pub fn interactive_delete(db: &Db, top_n: usize, path_prefixes: &[String], filter_exts: &[String], exclude_exts: &[String]) -> Result<()> {
+    let all_files = db.get_top_files(top_n, Some("exists"), path_prefixes)?;
+
+    // Apply extension include/exclude filters
+    let files: Vec<_> = all_files
+        .into_iter()
+        .filter(|f| {
+            let path_lower = f.path.to_lowercase();
+            // Include filter: if set, file must match one of the extensions
+            if !filter_exts.is_empty()
+                && !filter_exts.iter().any(|ext| path_lower.ends_with(&format!(".{}", ext)))
+            {
+                return false;
+            }
+            // Exclude filter: if set, file must NOT match any of the extensions
+            if !exclude_exts.is_empty()
+                && exclude_exts.iter().any(|ext| path_lower.ends_with(&format!(".{}", ext)))
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
 
     if files.is_empty() {
-        if path_prefixes.is_empty() {
+        if !filter_exts.is_empty() || !exclude_exts.is_empty() {
+            let mut parts = Vec::new();
+            if !filter_exts.is_empty() {
+                let ext_list: Vec<String> = filter_exts.iter().map(|e| format!(".{}", e)).collect();
+                parts.push(format!("include: {}", ext_list.join(", ")));
+            }
+            if !exclude_exts.is_empty() {
+                let ext_list: Vec<String> = exclude_exts.iter().map(|e| format!(".{}", e)).collect();
+                parts.push(format!("exclude: {}", ext_list.join(", ")));
+            }
+            println!(
+                "\n  {} No files matching filters ({})\n",
+                "⚠".yellow(),
+                parts.join(" / ").yellow(),
+            );
+        } else if path_prefixes.is_empty() {
             println!(
                 "\n  {} No existing files in database. Run {} first.\n",
                 "⚠".yellow(),
@@ -52,10 +88,28 @@ pub fn interactive_delete(db: &Db, top_n: usize, path_prefixes: &[String]) -> Re
         return Ok(());
     }
 
+    let filter_label = {
+        let mut parts = Vec::new();
+        if !filter_exts.is_empty() {
+            let ext_list: Vec<String> = filter_exts.iter().map(|e| format!(".{}", e)).collect();
+            parts.push(format!("only: {}", ext_list.join(", ")));
+        }
+        if !exclude_exts.is_empty() {
+            let ext_list: Vec<String> = exclude_exts.iter().map(|e| format!(".{}", e)).collect();
+            parts.push(format!("excluding: {}", ext_list.join(", ")));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", parts.join(" / "))
+        }
+    };
+
     println!(
-        "\n{}  Select files to {} (↑↓ navigate, space toggle, enter confirm)\n",
+        "\n{}  Select files to {} (↑↓ navigate, space toggle, enter confirm){}\n",
         "🦈 TREESHARK".bold().cyan(),
-        "DELETE".red().bold()
+        "DELETE".red().bold(),
+        filter_label.yellow(),
     );
 
     let items: Vec<String> = files

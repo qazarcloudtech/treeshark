@@ -11,6 +11,7 @@ pub enum FileStatus {
     Exists,
     Deleted,
     Missing,
+    Moved,
 }
 
 impl FileStatus {
@@ -18,6 +19,7 @@ impl FileStatus {
         match s {
             "deleted" => Self::Deleted,
             "missing" => Self::Missing,
+            "moved" => Self::Moved,
             _ => Self::Exists,
         }
     }
@@ -27,6 +29,7 @@ impl FileStatus {
             Self::Exists => "exists".green().to_string(),
             Self::Deleted => "deleted".red().to_string(),
             Self::Missing => "missing".yellow().to_string(),
+            Self::Moved => "moved".blue().to_string(),
         }
     }
 }
@@ -43,6 +46,7 @@ pub struct FileRow {
     pub deleted_at: Option<String>,
     pub times_seen: u32,
     pub last_scan_id: i64,
+    pub moved_to: Option<String>,
 }
 
 /// A scan session row
@@ -125,6 +129,12 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_files_size   ON files(size DESC);
              CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);",
         )?;
+
+        // Migration: add moved_to column for move tracking
+        self.conn
+            .execute_batch("ALTER TABLE files ADD COLUMN moved_to TEXT;")
+            .ok();
+
         Ok(())
     }
 
@@ -255,11 +265,17 @@ impl Db {
 
     // ─── File operations ────────────────────────────────────
 
-    /// Batch upsert for performance — wraps in a transaction
-    pub fn upsert_files_batch(&self, files: &[(String, u64)], scan_id: i64) -> Result<()> {
+    /// Batch upsert for performance — wraps in a transaction.
+    /// Returns (new_files, updated_files) count.
+    pub fn upsert_files_batch(&self, files: &[(String, u64)], scan_id: i64) -> Result<(usize, usize)> {
         let tx = self.conn.unchecked_transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
+        let mut new_count = 0usize;
+        let mut updated_count = 0usize;
         {
+            let mut check_stmt = tx.prepare_cached(
+                "SELECT 1 FROM files WHERE path = ?1",
+            )?;
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO files (path, size, status, first_seen_at, last_seen_at, first_scan_id, last_scan_id, times_seen)
                  VALUES (?1, ?2, 'exists', ?3, ?3, ?4, ?4, 1)
@@ -272,11 +288,17 @@ impl Db {
                     times_seen = times_seen + 1",
             )?;
             for (path, size) in files {
+                let exists = check_stmt.query_row(params![path], |_| Ok(true)).unwrap_or(false);
                 stmt.execute(params![path, *size as i64, now, scan_id])?;
+                if exists {
+                    updated_count += 1;
+                } else {
+                    new_count += 1;
+                }
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok((new_count, updated_count))
     }
 
     /// Mark a file as deleted
@@ -289,9 +311,52 @@ impl Db {
         Ok(())
     }
 
+    /// Mark a file as deleted by its moved_to path (used by purge)
+    pub fn mark_deleted_by_moved_to(&self, moved_to: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE files SET status = 'deleted', deleted_at = ?1, moved_to = NULL WHERE moved_to = ?2",
+            params![now, moved_to],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a file as moved to a new location
+    pub fn mark_moved(&self, original_path: &str, moved_to: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE files SET status = 'moved', deleted_at = ?1, moved_to = ?2 WHERE path = ?3",
+            params![now, moved_to, original_path],
+        )?;
+        Ok(())
+    }
+
+    /// Get all moved files (for restore)
+    pub fn get_moved_files(&self) -> Result<Vec<FileRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size, status, first_seen_at, last_seen_at, deleted_at, times_seen, last_scan_id, moved_to
+             FROM files WHERE status = 'moved' ORDER BY size DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_file_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Restore a moved file back to exists
+    pub fn mark_restored(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET status = 'exists', deleted_at = NULL, moved_to = NULL WHERE path = ?1",
+            params![path],
+        )?;
+        Ok(())
+    }
+
     /// Mark files not seen in current scan as 'missing' — only under the scanned paths.
     /// Files outside the scan scope are left untouched.
-    pub fn mark_missing_from_scan(&self, scan_id: i64, scanned_paths: &[String]) -> Result<u64> {
+    /// Only marks files whose size >= min_size_bytes — files below the threshold
+    /// simply weren't looked for, so we can't know if they're still there.
+    pub fn mark_missing_from_scan(&self, scan_id: i64, scanned_paths: &[String], min_size_bytes: u64) -> Result<u64> {
         if scanned_paths.is_empty() {
             return Ok(0);
         }
@@ -299,11 +364,11 @@ impl Db {
         let path_clauses: Vec<String> = scanned_paths
             .iter()
             .enumerate()
-            .map(|(i, _)| format!("path LIKE ?{} || '%'", i + 2))
+            .map(|(i, _)| format!("path LIKE ?{} || '%'", i + 3))
             .collect();
         let sql = format!(
             "UPDATE files SET status = 'missing'
-             WHERE status = 'exists' AND last_scan_id != ?1 AND ({})",
+             WHERE status = 'exists' AND last_scan_id != ?1 AND size >= ?2 AND ({})",
             path_clauses.join(" OR ")
         );
 
@@ -311,6 +376,7 @@ impl Db {
         use rusqlite::types::ToSql;
         let mut sql_params: Vec<Box<dyn ToSql>> = Vec::new();
         sql_params.push(Box::new(scan_id));
+        sql_params.push(Box::new(min_size_bytes as i64));
         for p in scanned_paths {
             let normalized = if p.ends_with('/') {
                 p.clone()
@@ -373,7 +439,7 @@ impl Db {
         };
 
         let sql = format!(
-            "SELECT path, size, status, first_seen_at, last_seen_at, deleted_at, times_seen, last_scan_id
+            "SELECT path, size, status, first_seen_at, last_seen_at, deleted_at, times_seen, last_scan_id, moved_to
              FROM files {} ORDER BY size DESC LIMIT ?{}",
             where_clause,
             bind_values.len() + 1
@@ -406,6 +472,7 @@ impl Db {
             deleted_at: row.get(5)?,
             times_seen: row.get(6)?,
             last_scan_id: row.get(7)?,
+            moved_to: row.get(8)?,
         })
     }
 
@@ -429,6 +496,11 @@ impl Db {
             [],
             |r| r.get(0),
         )?;
+        let moved: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE status = 'moved'",
+            [],
+            |r| r.get(0),
+        )?;
         let total_size_exists: Option<i64> = self
             .conn
             .query_row(
@@ -447,6 +519,15 @@ impl Db {
             )
             .optional()?
             .flatten();
+        let total_size_moved: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT SUM(size) FROM files WHERE status = 'moved'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
         let total_scans: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM scans", [], |r| r.get(0))?;
@@ -456,8 +537,10 @@ impl Db {
             exists: exists as u64,
             deleted: deleted as u64,
             missing: missing as u64,
+            moved: moved as u64,
             total_size_exists: total_size_exists.unwrap_or(0) as u64,
             total_size_deleted: total_size_deleted.unwrap_or(0) as u64,
+            total_size_moved: total_size_moved.unwrap_or(0) as u64,
             total_scans: total_scans as u64,
         })
     }
@@ -477,7 +560,9 @@ pub struct DbStats {
     pub exists: u64,
     pub deleted: u64,
     pub missing: u64,
+    pub moved: u64,
     pub total_size_exists: u64,
     pub total_size_deleted: u64,
+    pub total_size_moved: u64,
     pub total_scans: u64,
 }

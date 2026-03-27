@@ -189,6 +189,12 @@ pub fn print_stats(stats: &DbStats, db: &Db) -> Result<()> {
         ByteSize(stats.total_size_deleted).to_string().red()
     );
     println!(
+        "    {}    {:>6}   {} staged",
+        "├─ moved:".bold(),
+        stats.moved.to_string().blue(),
+        ByteSize(stats.total_size_moved).to_string().blue()
+    );
+    println!(
         "    {}   {:>6}",
         "└─ missing:".bold(),
         stats.missing.to_string().yellow(),
